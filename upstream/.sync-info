@@ -1,5 +1,5 @@
-commit=1352c02b802c1aa6ab6d3ac5781ef6b4c8693094
-timestamp=2026-11-13T06:30:49Z
+commit=dc1f1d7e741eaae24c7c11a8de8892f36ed01b49
+timestamp=2026-11-16T08:43:35Z
 upstream_url=https://github.com/tigerowo/infinite-canvas
 upstream_branch=main
-source_ref=v0.8.4-2-g1352c02
+source_ref=v0.8.4-3-gdc1f1d7
