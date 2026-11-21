@@ -28,6 +28,7 @@ import {
 import {
     CANVAS_AGENT_SKILL_FILE_TOOL,
     CANVAS_AGENT_TOOLS,
+    CANVAS_AGENT_VIDEO_TOOL,
     canvasAgentActionLabel,
     isCanvasAgentMediaAction,
     normalizeCanvasAgentAction,
@@ -52,11 +53,14 @@ export type RunCanvasAgentInput = {
     references: CanvasAssistantReference[];
     skillsSelected?: boolean;
     activeSkillContents?: Array<{ id: string; source: "system" | "user"; name: string; content: string; hasFiles?: boolean }>;
+    enableVideoAnalysis?: boolean;
     contextCheckpoint?: string;
     preferredJsonMode?: CanvasAgentJsonFallbackMode;
     getContext: (state: CanvasAgentState) => CanvasAgentContext;
     executeAction: (action: CanvasAgentAction, signal?: AbortSignal) => Promise<CanvasAgentToolResult>;
     onEvent?: (event: CanvasAgentRuntimeEvent) => void;
+    onReasoning?: (delta: string) => void;
+    onText?: (text: string) => void;
     onContextUsage?: (usage: CanvasAgentContextUsage) => void;
     onCheckpoint?: (checkpoint: {
         state: CanvasAgentState;
@@ -103,7 +107,8 @@ export async function runCanvasAgent(input: RunCanvasAgentInput): Promise<RunCan
     let contextCheckpoint = input.contextCheckpoint;
     const activeSkillContents = input.activeSkillContents?.map((skill, index) => `【完整 Skill ${index + 1}：${skill.name}（${skill.source === "system" ? `系统 Skill ID：${skill.id}` : "用户 Skill"}）】\n${skill.content}`).join("\n\n");
     const skillFileToolAvailable = Boolean(input.activeSkillContents?.some((skill) => skill.source === "system" && skill.hasFiles));
-    const agentTools = skillFileToolAvailable ? [...CANVAS_AGENT_TOOLS, CANVAS_AGENT_SKILL_FILE_TOOL] : CANVAS_AGENT_TOOLS;
+    let agentTools = skillFileToolAvailable ? [...CANVAS_AGENT_TOOLS, CANVAS_AGENT_SKILL_FILE_TOOL] : CANVAS_AGENT_TOOLS;
+    if (input.enableVideoAnalysis) agentTools = [...agentTools, CANVAS_AGENT_VIDEO_TOOL];
 
     const emitCheckpoint = () => input.onCheckpoint?.({
         state,
@@ -146,10 +151,15 @@ export async function runCanvasAgent(input: RunCanvasAgentInput): Promise<RunCan
 
     for (let step = 0; step < MAX_AGENT_STEPS; step++) {
         throwIfAborted(input.signal);
-        input.onEvent?.({ status: "thinking", label: step ? "正在根据画布结果继续" : "正在理解画布和创作目标" });
+        input.onEvent?.({ status: "thinking", label: step ? "正在根据画布结果继续" : "" });
         const context = input.getContext(state);
         const canvasContext = serializeCanvasAgentContext(context);
-        const buildPrompt = () => buildCanvasAgentSkillPrompt(state.phase, input.userText, context, activeSkillContents, contextCheckpoint, skillFileToolAvailable, false);
+        const buildPrompt = () => buildCanvasAgentSkillPrompt(state.phase, input.userText, context, activeSkillContents, contextCheckpoint, skillFileToolAvailable, false)
+            + (input.enableVideoAnalysis
+                ? "\n\n用户要求看懂视频画面时，对引用的真实节点调用 analyze_video。"
+                    + "已有 Skill 可以传真实节点 ID。只把视频用于生成参考时使用原有生成工具。"
+                    + "后续动作依赖视频观察时，先单独调用 analyze_video，等结果返回后再调用对应工具。"
+                : "");
         let systemPrompt = buildPrompt();
         const nativeTools = toolMode === "native";
         const tools = nativeTools ? agentTools : [];
@@ -169,6 +179,8 @@ export async function runCanvasAgent(input: RunCanvasAgentInput): Promise<RunCan
             tools: agentTools,
             toolMode,
             onContextUsage: input.onContextUsage,
+            onReasoning: input.onReasoning,
+            onText: input.onText,
             signal: input.signal,
         });
         let turn: Awaited<ReturnType<typeof requestCanvasAgentTurn>>;
@@ -204,7 +216,7 @@ export async function runCanvasAgent(input: RunCanvasAgentInput): Promise<RunCan
         };
         let nativeActions: CanvasAgentAction[] = [];
         let actionError = turn.toolError || (turn.toolCalls.length
-            ? turn.toolCalls.find((toolCall) => toolCall.argumentsError)?.argumentsError
+            ? turn.toolCalls.find((toolCall) => toolCall.name !== "present_choices" && toolCall.argumentsError)?.argumentsError
             : parsedJson.error);
         if (!actionError) {
             try {
@@ -217,6 +229,7 @@ export async function runCanvasAgent(input: RunCanvasAgentInput): Promise<RunCan
             actionError = "本轮必须返回可执行的画布工具指令";
         }
         if (actionError) {
+            input.onText?.("");
             if (protocolError) throw new Error("工具指令仍无效，本批操作未执行：" + actionError);
             protocolError = actionError;
             const feedback = JSON.stringify({
@@ -237,6 +250,7 @@ export async function runCanvasAgent(input: RunCanvasAgentInput): Promise<RunCan
         }
         const arrangeRequested = canvasAgentAllowsArrangement(input.userText);
         const requestedActions = nativeActions.length ? nativeActions : parsedJson.actions;
+        if (requestedActions.length) input.onText?.("");
         const actions = requestedActions.filter((action) => action.name !== "arrange_nodes" || arrangeRequested);
         const rejectedToolMessages: CanvasAgentProtocolMessage[] = nativeActions.filter((action) => action.name === "arrange_nodes" && !arrangeRequested).map((action) => ({
             role: "tool",
@@ -271,12 +285,17 @@ export async function runCanvasAgent(input: RunCanvasAgentInput): Promise<RunCan
             return { reply: finalReply, state, protocolMessages: persistCanvasAgentProtocolMessages(protocolMessages), contextCheckpoint, jsonFallbackMode: usedJsonFallbackMode };
         }
 
-        expectedAction = false;
-        protocolError = undefined;
-        input.onEvent?.({ status: "running", label: actions.length === 1 ? canvasAgentActionLabel(actions[0]) : "正在执行 " + actions.length + " 个画布操作" });
+        const canvasActions = actions.filter((action) => action.name !== "present_choices");
+        if (canvasActions.length) {
+            input.onEvent?.({ status: "running", label: canvasActions.length === 1 ? canvasAgentActionLabel(canvasActions[0]) : "正在执行 " + canvasActions.length + " 个画布操作" });
+        }
 
         const results = await executeActions(actions, state, input.executeAction, input.signal, input.onEvent);
-        hasExecutedActions = true;
+        if (canvasActions.length || results.items.some(({ action, result }) => action.name === "present_choices" && result.ok)) {
+            expectedAction = false;
+            protocolError = undefined;
+            hasExecutedActions = true;
+        }
         state = results.state;
 
         if (nativeActions.length && toolMode === "native") {
@@ -323,7 +342,7 @@ export async function executeActions(
     let state = initialState;
     const executeOne = async (action: CanvasAgentAction) => {
         throwIfAborted(signal);
-        onEvent?.({ status: "running", label: canvasAgentActionLabel(action) });
+        if (action.name !== "present_choices") onEvent?.({ status: "running", label: canvasAgentActionLabel(action) });
         try {
             const result = await executeAction(action);
             if (action.name === "set_agent_state" && result.ok) state = applyAgentState(state, action.arguments);
@@ -341,7 +360,7 @@ export async function executeActions(
         }
     };
 
-    const items = actions.every(isCanvasAgentMediaAction)
+    const items = actions.every((action) => action.name === "present_choices" || isCanvasAgentMediaAction(action))
         ? await Promise.all(actions.map(executeOne))
         : await actions.reduce<Promise<Array<{ action: CanvasAgentAction; result: CanvasAgentToolResult }>>>(
             async (pending, action) => [...(await pending), await executeOne(action)],
